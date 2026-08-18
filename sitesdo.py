@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
-scrape_upload.py
-
+sitesdo.py
 Scrapes <img> src values (and a best-effort caption) from elements with
-class "item-post" on a given page URL, auto-scrolling to trigger lazy-loaded
-/ infinite-scroll content. Only .jpg images are kept.
+class "item-post" on one or more page URLs, auto-scrolling to trigger
+lazy-loaded / infinite-scroll content. Only .jpg images are kept.
 
-New images are downloaded, then uploaded to Mega.nz (via rclone) in a single
-batch pass, and their File Name + Caption are logged to a Google Sheet.
+New images are downloaded in parallel, then uploaded to Mega.nz (via rclone)
+in a single batch pass, and their File Name + Caption are logged to a Google Sheet.
 
 Duplicate prevention:
     Before anything else, urls_already_downloaded.txt is pulled from the
-    ROOT of the Mega remote (shared across every folder/run, not per-folder,
-    so the same file protects against duplicates no matter which folder
-    you're scraping into this run). Any scraped image URL already in that
-    file is skipped entirely (not downloaded, not logged). Newly-seen URLs
-    are written into the local copy BEFORE download starts (so a crash
-    mid-run doesn't cause endless re-attempts), and the updated file
-    OVERWRITES the Mega root copy at the end of the run (not appended).
+    ROOT of the Mega remote (shared across every folder/run). Any scraped
+    image URL already in that file is skipped. Newly-seen URLs are written
+    into the local copy BEFORE download starts, and the updated file
+    OVERWRITES the Mega root copy at the end of the run.
 
-Usage:
-    python scrape_upload.py --url "https://example.com/page" --folder-name "MyFolder"
+Usage (local):
+    python sitesdo.py --url "https://example.com/page1" --url "https://example.com/page2" --folder-name "MyFolder"
+    # or
+    python sitesdo.py --url "https://a.com,https://b.com" --folder-name "MyFolder"
+    # or multi-line via env / file
 
-Env vars (used by the GitHub Actions workflow, but work locally too):
-    PAGE_URL                 -> same as --url
-    MEGA_FOLDER_NAME          -> same as --folder-name (folder path on the Mega remote)
-    RCLONE_CONFIG_PATH        -> path to rclone.conf (default "rclone.conf")
-    RCLONE_REMOTE_NAME        -> name of the remote inside rclone.conf (default "mega")
-    GOOGLE_APPLICATION_CREDENTIALS -> path to Google service-account JSON
-    MAX_IDLE_SCROLLS          -> (optional) override the default of 8
+Env vars (GitHub Actions):
+    PAGE_URL          -> one or more URLs (newline or comma separated)
+    MEGA_FOLDER_NAME  -> folder path on the Mega remote
+    ...
 """
 
 import argparse
@@ -46,7 +42,6 @@ from urllib.parse import urlparse
 
 import requests
 from playwright.sync_api import sync_playwright
-
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
@@ -56,7 +51,6 @@ DOWNLOAD_DIR = Path("downloaded_images")
 DEDUP_FILENAME = "urls_already_downloaded.txt"
 DEDUP_LOCAL_PATH = Path(DEDUP_FILENAME)
 
-# Default target sheet. Can be overridden with the SPREADSHEET_ID env var / --spreadsheet-id flag.
 DEFAULT_SPREADSHEET_ID = "1OQns3xUPeTQslsw0FaD-a85DAM0Sc_L6BnaGDMqGPmY"
 SHEET_HEADER = ["File Name", "Caption"]
 
@@ -66,35 +60,100 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 
+def parse_urls(raw: str | list[str] | None) -> list[str]:
+    """Turn a string (newlines / commas) or list into a clean list of unique URLs."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        parts = raw
+    else:
+        # split on newlines first, then on commas inside each line
+        parts = []
+        for line in str(raw).splitlines():
+            parts.extend(line.split(","))
+    urls = []
+    seen = set()
+    for p in parts:
+        u = p.strip()
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Scrape .item-post images and upload to Mega.nz")
-    p.add_argument("--url", default=os.environ.get("PAGE_URL"), help="Page URL to scrape")
-    p.add_argument("--folder-name", default=os.environ.get("MEGA_FOLDER_NAME"),
-                   help="Mega folder path to upload images into")
-    p.add_argument("--max-idle-scrolls", type=int,
-                   default=int(os.environ.get("MAX_IDLE_SCROLLS", "8")),
-                   help="Stop after this many consecutive scrolls with no new images (default: 8)")
-    p.add_argument("--max-images", type=int,
-                   default=(int(os.environ["MAX_IMAGES"]) if os.environ.get("MAX_IMAGES") else None),
-                   help="Optional cap on total images to scrape/download/upload.")
-    p.add_argument("--spreadsheet-id", default=os.environ.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID),
-                   help="Google Sheet ID to log file names + captions into")
-    p.add_argument("--sheet-tab", default=os.environ.get("SHEET_TAB") or None,
-                   help="Tab name inside the spreadsheet to append rows to. "
-                        "If omitted, the folder name is used as the tab name "
-                        "(created automatically if it doesn't exist yet).")
-    p.add_argument("--download-concurrency", type=int,
-                   default=int(os.environ.get("DOWNLOAD_CONCURRENCY", "10")),
-                   help="How many images to download in parallel (default: 10)")
-    p.add_argument("--rclone-config", default=os.environ.get("RCLONE_CONFIG_PATH", "rclone.conf"))
-    p.add_argument("--rclone-remote", default=os.environ.get("RCLONE_REMOTE_NAME", "mega"))
+    p = argparse.ArgumentParser(
+        description="Scrape .item-post images from one or more pages and upload to Mega.nz"
+    )
+    p.add_argument(
+        "--url",
+        action="append",
+        default=None,
+        help="Page URL to scrape. Can be given multiple times. "
+             "Also accepts a single value with commas or newlines.",
+    )
+    p.add_argument(
+        "--folder-name",
+        default=os.environ.get("MEGA_FOLDER_NAME"),
+        help="Mega folder path to upload images into",
+    )
+    p.add_argument(
+        "--max-idle-scrolls",
+        type=int,
+        default=int(os.environ.get("MAX_IDLE_SCROLLS", "8")),
+        help="Stop after this many consecutive scrolls with no new images (default: 8)",
+    )
+    p.add_argument(
+        "--max-images",
+        type=int,
+        default=(int(os.environ["MAX_IMAGES"]) if os.environ.get("MAX_IMAGES") else None),
+        help="Optional cap on total images to scrape/download/upload across all URLs.",
+    )
+    p.add_argument(
+        "--spreadsheet-id",
+        default=os.environ.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID),
+        help="Google Sheet ID to log file names + captions into",
+    )
+    p.add_argument(
+        "--sheet-tab",
+        default=os.environ.get("SHEET_TAB") or None,
+        help="Tab name inside the spreadsheet. If omitted, folder name is used.",
+    )
+    p.add_argument(
+        "--download-concurrency",
+        type=int,
+        default=int(os.environ.get("DOWNLOAD_CONCURRENCY", "10")),
+        help="How many images to download in parallel (default: 10)",
+    )
+    p.add_argument(
+        "--upload-transfers",
+        type=int,
+        default=int(os.environ.get("UPLOAD_TRANSFERS", "8")),
+        help="How many files rclone uploads to Mega in parallel (default: 8)",
+    )
+    p.add_argument(
+        "--rclone-config",
+        default=os.environ.get("RCLONE_CONFIG_PATH", "rclone.conf"),
+    )
+    p.add_argument(
+        "--rclone-remote",
+        default=os.environ.get("RCLONE_REMOTE_NAME", "mega"),
+    )
     p.add_argument("--headless", action="store_true", default=True)
+
     args = p.parse_args()
 
-    if not args.url:
-        sys.exit("ERROR: --url (or PAGE_URL env var) is required")
+    # Prefer CLI --url (can be repeated). Fall back to PAGE_URL env.
+    cli_urls = args.url or []
+    env_urls = os.environ.get("PAGE_URL", "")
+    all_raw = cli_urls + ([env_urls] if env_urls else [])
+    args.urls = parse_urls(all_raw)
+
+    if not args.urls:
+        sys.exit("ERROR: at least one URL is required (--url or PAGE_URL env var)")
     if not args.folder_name:
         sys.exit("ERROR: --folder-name (or MEGA_FOLDER_NAME env var) is required")
+
     return args
 
 
@@ -104,9 +163,7 @@ def is_jpg(url: str) -> bool:
 
 
 def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None) -> dict:
-    """Scroll the page repeatedly, collecting unique .jpg/.jpeg image URLs
-    inside .item-post blocks, along with a best-effort caption for each.
-
+    """Scroll one page, collecting unique .jpg/.jpeg image URLs + captions.
     Returns: {image_url: caption}
     """
     found = {}
@@ -115,9 +172,7 @@ def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None
 
     log(f"Launching browser and opening: {url}")
     if max_images:
-        log(f"Image limit set: will stop as soon as {max_images} images are found.")
-    else:
-        log(f"No image limit set: will scrape until {max_idle_scrolls} consecutive idle scrolls.")
+        log(f"  (remaining image budget for this page: {max_images})")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -131,11 +186,6 @@ def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None
         log("Page loaded. Waiting for initial images to render...")
         page.wait_for_timeout(2000)
 
-        # Caption comes from the actual visible link text inside
-        # .info h2.elips a (e.g. "Chef now for foods recipes"), never
-        # from the alt/title attribute. Falls back to the same
-        # element's text, then common caption classes, then the
-        # block's own trimmed text as a last resort.
         extract_js = """
         els => els.map(el => {
             const img = el.querySelector('img');
@@ -170,11 +220,13 @@ def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None
                     if max_images and len(found) >= max_images:
                         break
 
-            log(f"Scroll #{scroll_count}: {len(found)} unique jpgs found so far "
-                f"(+{new_this_round} new this round, idle streak: {idle_scrolls}/{max_idle_scrolls})")
+            log(
+                f"  Scroll #{scroll_count}: {len(found)} unique jpgs so far "
+                f"(+{new_this_round} new, idle: {idle_scrolls}/{max_idle_scrolls})"
+            )
 
             if max_images and len(found) >= max_images:
-                log(f"Reached the requested limit of {max_images} images. Stopping scroll loop.")
+                log(f"  Reached image limit for this page ({max_images}). Stopping.")
                 break
 
             if new_this_round == 0:
@@ -183,32 +235,53 @@ def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None
                 idle_scrolls = 0
 
             if idle_scrolls >= max_idle_scrolls:
-                log(f"No new images for {max_idle_scrolls} consecutive scrolls. Stopping scroll loop.")
+                log(f"  No new images for {max_idle_scrolls} consecutive scrolls. Stopping.")
                 break
 
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             scroll_count += 1
-            log(f"Scrolled to bottom (scroll #{scroll_count}), waiting for new content to load...")
+            log(f"  Scrolled to bottom (scroll #{scroll_count}), waiting...")
             try:
                 page.wait_for_load_state("networkidle", timeout=5000)
             except Exception:
-                log("  (network still busy after 5s, continuing anyway)")
+                log("  (network still busy after 5s, continuing)")
             page.wait_for_timeout(1500)
 
         browser.close()
-        log("Browser closed.")
+        log("Browser closed for this URL.")
 
     if max_images and len(found) > max_images:
         found = dict(list(found.items())[:max_images])
-
     return found
+
+
+def scrape_all_urls(urls: list[str], max_idle_scrolls: int, max_images: int | None) -> dict:
+    """Scrape every URL, merging results. Stops early if max_images is hit."""
+    all_found: dict[str, str] = {}
+    remaining = max_images
+
+    for i, url in enumerate(urls, 1):
+        log(f"=== Scraping URL {i}/{len(urls)} ===")
+        page_found = scrape_images(url, max_idle_scrolls, remaining)
+        before = len(all_found)
+        all_found.update(page_found)
+        added = len(all_found) - before
+        log(f"URL {i} contributed {added} new unique images (total so far: {len(all_found)})")
+
+        if max_images is not None:
+            remaining = max_images - len(all_found)
+            if remaining <= 0:
+                log(f"Global image limit of {max_images} reached. Skipping remaining URLs.")
+                break
+
+    return all_found
 
 
 _progress_lock = threading.Lock()
 
 
 def _download_one(src: str, caption: str, headers: dict, used_names: set,
-                   names_lock: threading.Lock, max_retries: int = 3):
+                  names_lock: threading.Lock, max_retries: int = 3):
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -236,7 +309,6 @@ def _download_one(src: str, caption: str, headers: dict, used_names: set,
     with open(dest, "wb") as f:
         for chunk in resp.iter_content(8192):
             f.write(chunk)
-
     return dest, src, caption
 
 
@@ -276,6 +348,7 @@ def download_images(urls_captions: dict, concurrency: int = 10) -> list:
 # ---------------------------------------------------------------------------
 # Mega.nz helpers (via rclone)
 # ---------------------------------------------------------------------------
+
 def rclone_remote_target(remote_name: str, config_path: str, folder_name: str) -> str:
     if not os.path.exists(config_path):
         sys.exit(f"ERROR: rclone config file not found at {config_path}")
@@ -283,9 +356,6 @@ def rclone_remote_target(remote_name: str, config_path: str, folder_name: str) -
 
 
 def pull_dedup_file(remote_root: str, config_path: str):
-    """Fetch the existing dedup list from the ROOT of the Mega remote (shared
-    across every folder this scraper is ever pointed at, not per-folder).
-    If it doesn't exist yet (first run overall), start with an empty file."""
     result = subprocess.run(
         ["rclone", "--config", config_path, "copyto",
          f"{remote_root}{DEDUP_FILENAME}", str(DEDUP_LOCAL_PATH)],
@@ -305,16 +375,12 @@ def load_existing_urls() -> set:
 
 
 def record_new_urls(urls):
-    """Append newly-seen URLs to the local dedup file BEFORE download starts,
-    so a crash mid-run won't cause the same URLs to be retried forever."""
     with open(DEDUP_LOCAL_PATH, "a") as f:
         for u in urls:
             f.write(u + "\n")
 
 
 def push_dedup_file(remote_root: str, config_path: str):
-    """Overwrite (not append) the copy at the Mega ROOT so it always
-    reflects the current local state, shared across all folders."""
     result = subprocess.run(
         ["rclone", "--config", config_path, "copyto",
          str(DEDUP_LOCAL_PATH), f"{remote_root}{DEDUP_FILENAME}"],
@@ -327,14 +393,14 @@ def push_dedup_file(remote_root: str, config_path: str):
 
 
 def rclone_upload_all(remote_target: str, config_path: str, transfers: int = 8) -> bool:
-    """One-shot copy of the whole download directory to Mega, tuned for
-    throughput and resilience since this can push many files in one call."""
-    log(f"⬆️ Uploading batch to '{remote_target}' via rclone...")
+    """One-shot parallel copy of the whole download directory to Mega."""
+    log(f"⬆️ Uploading batch to '{remote_target}' via rclone "
+        f"({transfers} parallel transfers)...")
     result = subprocess.run(
         [
             "rclone", "--config", config_path, "copy", str(DOWNLOAD_DIR), remote_target,
             "--transfers", str(transfers),
-            "--checkers", str(transfers * 2),
+            "--checkers", str(max(transfers * 2, 16)),
             "--retries", "5",
             "--low-level-retries", "10",
             "--contimeout", "30s",
@@ -356,6 +422,7 @@ def rclone_upload_all(remote_target: str, config_path: str, transfers: int = 8) 
 # ---------------------------------------------------------------------------
 # Google Sheets helpers
 # ---------------------------------------------------------------------------
+
 def get_sheets_service():
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "google_creds.json")
     if not os.path.exists(creds_path):
@@ -365,16 +432,11 @@ def get_sheets_service():
 
 
 def sanitize_sheet_tab_name(name: str) -> str:
-    """Google Sheets tab names can't contain [ ] * ? / \\ : and have a
-    100-char limit, so clean the folder name up before using it as a tab
-    name."""
     cleaned = re.sub(r'[\[\]\*\?/\\:]', "_", name).strip()
     return (cleaned or "Sheet")[:100]
 
 
 def ensure_sheet_tab(service, spreadsheet_id: str, tab_name: str):
-    """Create the tab if it doesn't exist yet; do nothing (and definitely
-    don't touch existing data) if it already does."""
     meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     existing_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
     if tab_name in existing_titles:
@@ -383,7 +445,7 @@ def ensure_sheet_tab(service, spreadsheet_id: str, tab_name: str):
         spreadsheetId=spreadsheet_id,
         body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
     ).execute()
-    log(f"📄 Created new sheet tab '{tab_name}' (folder-specific).")
+    log(f"📄 Created new sheet tab '{tab_name}'.")
 
 
 def ensure_sheet_header(service, spreadsheet_id: str, sheet_tab: str):
@@ -409,14 +471,11 @@ def log_to_sheet(spreadsheet_id: str, sheet_tab: str, saved: list):
     if not saved:
         log("Nothing new to log to Sheets.")
         return
-
     log(f"Writing {len(saved)} row(s) to Google Sheet ({sheet_tab})...")
     service = get_sheets_service()
     ensure_sheet_tab(service, spreadsheet_id, sheet_tab)
     ensure_sheet_header(service, spreadsheet_id, sheet_tab)
-
     rows = [[dest.name, caption] for dest, _src, caption in saved]
-
     try:
         result = service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
@@ -429,19 +488,23 @@ def log_to_sheet(spreadsheet_id: str, sheet_tab: str, saved: list):
         log(f"Sheet updated: {updated_rows} row(s) appended to '{sheet_tab}'.")
     except Exception as e:
         log(f"! Failed to write to Google Sheet: {e}")
-        log("  (Make sure the spreadsheet ID/tab are correct and shared with the service account.)")
+        log(" (Make sure the spreadsheet ID/tab are correct and shared with the service account.)")
 
 
 def main():
     args = parse_args()
 
     log("=== Starting run ===")
-    log(f"Page URL: {args.url}")
+    log(f"URLs to scrape ({len(args.urls)}):")
+    for i, u in enumerate(args.urls, 1):
+        log(f"  {i}. {u}")
     log(f"Mega folder: {args.folder_name}")
     if args.max_images:
-        log(f"Image limit: {args.max_images}")
+        log(f"Image limit (global): {args.max_images}")
     else:
-        log(f"Image limit: none (stop condition = {args.max_idle_scrolls} consecutive idle scrolls)")
+        log(f"Image limit: none (stop = {args.max_idle_scrolls} idle scrolls per page)")
+    log(f"Download concurrency: {args.download_concurrency}")
+    log(f"Upload transfers: {args.upload_transfers}")
 
     remote_target = rclone_remote_target(args.rclone_remote, args.rclone_config, args.folder_name)
     remote_root = f"{args.rclone_remote}:"
@@ -451,8 +514,8 @@ def main():
     existing_urls = load_existing_urls()
     log(f"{len(existing_urls)} URL(s) already recorded as downloaded.")
 
-    all_found = scrape_images(args.url, args.max_idle_scrolls, args.max_images)
-    log(f"=== Scrape complete: {len(all_found)} unique .jpg images found on page ===")
+    all_found = scrape_all_urls(args.urls, args.max_idle_scrolls, args.max_images)
+    log(f"=== Scrape complete: {len(all_found)} unique .jpg images found across all pages ===")
 
     if not all_found:
         log("No images found — nothing to do.")
@@ -466,26 +529,25 @@ def main():
         log("Nothing new to download — done.")
         return
 
-    # Record intent BEFORE downloading, so a crash mid-run won't cause retries
+    # Record intent BEFORE downloading
     record_new_urls(new_items.keys())
 
     saved = download_images(new_items, concurrency=args.download_concurrency)
 
     if saved:
-        rclone_upload_all(remote_target, args.rclone_config)
+        rclone_upload_all(remote_target, args.rclone_config, transfers=args.upload_transfers)
         for dest, _src, _caption in saved:
             if dest.exists():
                 dest.unlink()
     else:
         log("No images were successfully downloaded — nothing to upload.")
 
-    # Always push the updated dedup file, even if some downloads failed,
-    # since their URLs were already recorded above. This goes to the
-    # shared root file, not the per-folder location.
     push_dedup_file(remote_root, args.rclone_config)
-
-    log_to_sheet(args.spreadsheet_id, args.sheet_tab or sanitize_sheet_tab_name(args.folder_name), saved)
-
+    log_to_sheet(
+        args.spreadsheet_id,
+        args.sheet_tab or sanitize_sheet_tab_name(args.folder_name),
+        saved,
+    )
     log("=== Done ===")
 
 
