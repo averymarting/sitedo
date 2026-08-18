@@ -228,22 +228,30 @@ def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None
 
         while True:
             items = page.eval_on_selector_all(ITEM_SELECTOR, extract_js)
+            total_jpg_this_round = 0
             new_this_round = 0
+            dup_this_round = 0
             for item in items:
                 src = item.get("src")
                 caption = (item.get("caption") or "").strip()
                 if not src:
                     continue
                 src = normalize_img_url(src)
-                if is_jpg(src) and src not in found:
+                if not is_jpg(src):
+                    continue
+                total_jpg_this_round += 1
+                if src in found:
+                    dup_this_round += 1
+                else:
                     found[src] = caption
                     new_this_round += 1
                     if max_images and len(found) >= max_images:
                         break
 
             log(
-                f"  Scroll #{scroll_count}: {len(found)} unique jpgs so far "
-                f"(+{new_this_round} new, idle: {idle_scrolls}/{max_idle_scrolls})"
+                f"  Scroll #{scroll_count}: found {total_jpg_this_round} jpg(s) this scroll "
+                f"→ +{new_this_round} new, {dup_this_round} duplicate(s) | "
+                f"{len(found)} unique total (idle: {idle_scrolls}/{max_idle_scrolls})"
             )
 
             if max_images and len(found) >= max_images:
