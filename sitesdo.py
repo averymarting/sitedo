@@ -61,15 +61,18 @@ def log(msg: str):
 
 
 def parse_urls(raw: str | list[str] | None) -> list[str]:
-    """Turn a string (newlines / commas) or list into a clean list of unique URLs."""
+    """Turn a string (newlines / commas) or list into a clean list of unique URLs.
+
+    Always splits on newlines AND commas, even when the input is already a list
+    (e.g. a single env-var value that contains commas).
+    """
     if not raw:
         return []
-    if isinstance(raw, list):
-        parts = raw
-    else:
-        # split on newlines first, then on commas inside each line
-        parts = []
-        for line in str(raw).splitlines():
+    if isinstance(raw, str):
+        raw = [raw]
+    parts = []
+    for item in raw:
+        for line in str(item).splitlines():
             parts.extend(line.split(","))
     urls = []
     seen = set()
@@ -79,6 +82,21 @@ def parse_urls(raw: str | list[str] | None) -> list[str]:
             seen.add(u)
             urls.append(u)
     return urls
+
+
+def normalize_img_url(src: str) -> str:
+    """Turn protocol-relative (//...) or scheme-less URLs into absolute https URLs."""
+    if not src:
+        return src
+    src = src.strip()
+    if src.startswith("//"):
+        return "https:" + src
+    if src.startswith("/"):
+        # site-relative – rare, but handle it
+        return "https://www.erosberry.com" + src
+    if not src.startswith(("http://", "https://")):
+        return "https://" + src.lstrip("/")
+    return src
 
 
 def parse_args():
@@ -214,7 +232,10 @@ def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None
             for item in items:
                 src = item.get("src")
                 caption = (item.get("caption") or "").strip()
-                if src and is_jpg(src) and src not in found:
+                if not src:
+                    continue
+                src = normalize_img_url(src)
+                if is_jpg(src) and src not in found:
                     found[src] = caption
                     new_this_round += 1
                     if max_images and len(found) >= max_images:
