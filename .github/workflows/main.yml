@@ -1,9 +1,16 @@
 name: Scrape item-post images and upload to Mega.nz
+
 on:
   workflow_dispatch:
     inputs:
       page_url:
-        description: "Page URL to scrape (.item-post img elements)"
+        description: |
+          One or more page URLs to scrape (.item-post img elements).
+          Put each URL on its own line, OR separate them with commas.
+          Example:
+          https://site.com/page1
+          https://site.com/page2
+          https://site.com/page3
         required: true
         type: string
       mega_folder_name:
@@ -11,12 +18,12 @@ on:
         required: true
         type: string
       max_idle_scrolls:
-        description: "Stop after this many scrolls with no new images"
+        description: "Stop after this many scrolls with no new images (per page)"
         required: false
         default: "8"
         type: string
       max_images:
-        description: "Optional: max number of images to scrape (leave blank to scrape until 8 idle scrolls)"
+        description: "Optional: max total images across ALL urls (leave blank = no limit)"
         required: false
         default: ""
         type: string
@@ -26,7 +33,7 @@ on:
         default: "15_9D1UMPIYkq3vgeLxf4WdIxIrl_S_Oo_BmkIOpr7ng"
         type: string
       sheet_tab:
-        description: "(optional) Force a specific tab name — leave blank to auto-use th1zkyUbtpItYgw3eY1tN084PO17Y-uNBCQ5cENUK3u4rUe Mega folder name as the tab"
+        description: "(optional) Force a specific tab name — leave blank to use the Mega folder name"
         required: false
         default: ""
         type: string
@@ -40,6 +47,7 @@ on:
         required: false
         default: "8"
         type: string
+
 jobs:
   scrape-and-upload:
     runs-on: ubuntu-latest
@@ -47,26 +55,33 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install Python dependencies
         run: pip install -r requirements.txt
+
       - name: Install Playwright browsers
         run: playwright install --with-deps chromium
+
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
           rclone version
+
       - name: Write rclone config file
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
         run: printf '%s' "$RCLONE_CONF" > rclone.conf
+
       - name: Write Google credentials file
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > google_creds.json
+
       - name: Run scraper + Mega uploader
         env:
           PAGE_URL: ${{ inputs.page_url }}
@@ -76,14 +91,17 @@ jobs:
           SPREADSHEET_ID: ${{ inputs.spreadsheet_id }}
           SHEET_TAB: ${{ inputs.sheet_tab }}
           DOWNLOAD_CONCURRENCY: ${{ inputs.download_concurrency }}
+          UPLOAD_TRANSFERS: ${{ inputs.upload_transfers }}
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
           GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
           PYTHONUNBUFFERED: "1"
         run: python -u sitesdo.py
+
       - name: Clean up credentials files
         if: always()
         run: rm -f google_creds.json rclone.conf
+
       - name: Upload run log as artifact (optional debug aid)
         if: always()
         uses: actions/upload-artifact@v4
