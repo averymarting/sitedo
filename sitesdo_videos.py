@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
 """
 sitesdo_videos.py
-Scrapes unique video page links from elements with class "item-post" on one or
-more listing URLs (auto-scrolling for infinite/lazy content), visits each video
-page to extract the actual media URL (preferring .mp4), downloads only new
-videos, uploads them in one batch to Mega.nz via rclone, and logs
-File Name + Caption to a Google Sheet.
+=================
+Full pipeline in one script / one GitHub Actions workflow:
+
+  1. Scrape unique video page links from .item-post elements (auto-scroll).
+  2. Download only NEW videos (dedup via Mega-root urls_already_downloaded_videos.txt).
+  3. Run video_auto_editor.py UNCHANGED on the downloads to:
+       - strip intro / outro
+       - remove logos / watermarks / credit text
+       - split into N-second short clips
+       - optimize (max-dim, bitrate, faststart)
+  4. Upload ONLY the short optimized clips to Mega.nz (never the originals).
+  5. Log short-clip File Name + Caption (phrases stripped) to Google Sheet.
+
+Original full-length downloads are deleted after editing; only the edited
+shorts are uploaded and logged.
 
 Duplicate prevention:
-    Before anything else, urls_already_downloaded_videos.txt is pulled from the
-    ROOT of the Mega remote (shared across every folder/run). Any scraped video
-    page URL already in that file is skipped. Newly-seen URLs are written into
-    the local copy BEFORE download starts, and the updated file OVERWRITES the
-    Mega root copy at the end of the run.
+    urls_already_downloaded_videos.txt lives at the ROOT of the Mega remote
+    (shared across every folder/run). Scraped video *page* URLs already in
+    that file are skipped. Newly-seen page URLs are recorded BEFORE download
+    starts; the updated file is pushed back to Mega root at the end.
+
+Caption cleaning:
+    strip_phrases.txt is also pulled from Mega root (one full phrase per
+    line). Those phrases are removed from captions before they are written
+    to the Google Sheet.
 
 Usage (local):
     python sitesdo_videos.py --url "https://example.com/videos" --folder-name "MyVideos"
-    # or multi-line / comma-separated via env
 
 Env vars (GitHub Actions):
-    PAGE_URL, MEGA_FOLDER_NAME, MAX_IDLE_SCROLLS, MAX_VIDEOS, ...
+    PAGE_URL, MEGA_FOLDER_NAME, MAX_IDLE_SCROLLS, MAX_VIDEOS,
+    CLIP_SECONDS, ...
 """
 
 import argparse
@@ -43,10 +57,12 @@ from googleapiclient.discovery import build
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 ITEM_SELECTOR = ".item-post"
 DOWNLOAD_DIR = Path("downloaded_videos")
+EDITED_DIR = Path("edited_videos")
 DEDUP_FILENAME = "urls_already_downloaded_videos.txt"
 DEDUP_LOCAL_PATH = Path(DEDUP_FILENAME)
 STRIP_PHRASES_FILENAME = "strip_phrases.txt"
 STRIP_PHRASES_LOCAL_PATH = Path(STRIP_PHRASES_FILENAME)
+EDITOR_SCRIPT = Path("video_auto_editor.py")
 DEFAULT_SPREADSHEET_ID = "15_9D1UMPIYkq3vgeLxf4WdIxIrl_S_Oo_BmkIOpr7ng"
 SHEET_HEADER = ["File Name", "Caption"]
 
@@ -146,6 +162,25 @@ def parse_args():
     p.add_argument(
         "--rclone-remote",
         default=os.environ.get("RCLONE_REMOTE_NAME", "mega"),
+    )
+    # --- video_auto_editor.py options (passed through unchanged) ---
+    p.add_argument(
+        "--clip-seconds",
+        type=float,
+        default=float(os.environ.get("CLIP_SECONDS", "60")),
+        help="Length of each short part produced by the editor (default 60s)",
+    )
+    p.add_argument(
+        "--skip-edit",
+        action="store_true",
+        default=os.environ.get("SKIP_EDIT", "").lower() in ("1", "true", "yes"),
+        help="Skip video_auto_editor.py (upload raw downloads instead) — for debugging only",
+    )
+    p.add_argument(
+        "--editor-extra-args",
+        default=os.environ.get("EDITOR_EXTRA_ARGS", ""),
+        help="Extra CLI flags passed straight to video_auto_editor.py "
+             "(e.g. '--no-optimize --watermark none')",
     )
     p.add_argument("--headless", action="store_true", default=True)
     args = p.parse_args()
@@ -594,13 +629,14 @@ def push_dedup_file(remote_root: str, config_path: str):
         log("✅ urls_already_downloaded_videos.txt updated on Mega root.")
 
 
-def rclone_upload_all(remote_target: str, config_path: str, transfers: int = 4) -> bool:
-    """One-shot parallel copy of the whole download directory to Mega."""
-    log(f"⬆️ Uploading batch to '{remote_target}' via rclone "
+def rclone_upload_all(source_dir: Path, remote_target: str, config_path: str,
+                      transfers: int = 4) -> bool:
+    """One-shot parallel copy of source_dir to Mega."""
+    log(f"⬆️ Uploading batch from '{source_dir}' to '{remote_target}' via rclone "
         f"({transfers} parallel transfers)...")
     result = subprocess.run(
         [
-            "rclone", "--config", config_path, "copy", str(DOWNLOAD_DIR), remote_target,
+            "rclone", "--config", config_path, "copy", str(source_dir), remote_target,
             "--transfers", str(transfers),
             "--checkers", str(max(transfers * 2, 8)),
             "--retries", "5",
@@ -619,6 +655,86 @@ def rclone_upload_all(remote_target: str, config_path: str, transfers: int = 4) 
         return False
     log("✅ Batch upload to Mega complete.")
     return True
+
+
+# ---------------------------------------------------------------------------
+# video_auto_editor.py integration (script is used as-is, never modified)
+# ---------------------------------------------------------------------------
+def run_video_editor(clip_seconds: float, extra_args: str = "") -> bool:
+    """
+    Run video_auto_editor.py in batch mode on DOWNLOAD_DIR → EDITED_DIR.
+    The editor script is left completely untouched; we only call it.
+    """
+    if not EDITOR_SCRIPT.exists():
+        log(f"ERROR: {EDITOR_SCRIPT} not found in the working directory.")
+        return False
+
+    EDITED_DIR.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-u", str(EDITOR_SCRIPT),
+        "--mode", "batch",
+        "--batch", str(DOWNLOAD_DIR),
+        "--outdir", str(EDITED_DIR),
+        "--clip-seconds", str(clip_seconds),
+        "--shared-watermark-from-first",
+        "--watermark", "auto",
+    ]
+    if extra_args.strip():
+        # naive split is fine for simple flags; users can quote carefully via env
+        cmd.extend(extra_args.split())
+
+    log(f"🎬 Running video_auto_editor.py on {DOWNLOAD_DIR} → {EDITED_DIR}")
+    log(f"   cmd: {' '.join(cmd)}")
+    result = subprocess.run(cmd, text=True)
+    if result.returncode != 0:
+        log(f"⚠️ video_auto_editor.py exited with code {result.returncode}")
+        return False
+    log("✅ video_auto_editor.py finished.")
+    return True
+
+
+def map_edited_files_to_captions(saved: list) -> list:
+    """
+    After the editor runs, map each output short clip back to the original
+    video's caption.
+
+    video_auto_editor naming:
+      - single part  →  <stem>.mp4
+      - multi parts  →  <stem>_part01.mp4, <stem>_part02.mp4, ...
+
+    Returns list of (Path, caption) for every file in EDITED_DIR that we can
+    match to an original download.
+    """
+    # original stem → caption
+    stem_to_caption = {}
+    for dest, _src, caption in saved:
+        stem_to_caption[dest.stem] = caption
+
+    results = []
+    if not EDITED_DIR.exists():
+        return results
+
+    for path in sorted(EDITED_DIR.iterdir()):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in (".mp4", ".mov", ".mkv", ".webm", ".avi"):
+            continue
+        # strip _partNN suffix if present
+        stem = path.stem
+        m = re.match(r"^(.+)_part\d+$", stem, re.IGNORECASE)
+        base_stem = m.group(1) if m else stem
+
+        caption = stem_to_caption.get(base_stem, "")
+        if not caption:
+            # try a looser match (editor sometimes sanitizes names)
+            for orig_stem, cap in stem_to_caption.items():
+                if base_stem.startswith(orig_stem) or orig_stem.startswith(base_stem):
+                    caption = cap
+                    break
+        results.append((path, caption))
+        log(f"  mapped {path.name} ← caption={caption[:60]!r}...")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -665,24 +781,35 @@ def ensure_sheet_header(service, spreadsheet_id: str, sheet_tab: str):
         log("📝 Wrote sheet header row.")
 
 
-def log_to_sheet(spreadsheet_id: str, sheet_tab: str, saved: list, strip_phrases: list[str] | None = None):
+def log_to_sheet(spreadsheet_id: str, sheet_tab: str, items: list,
+                 strip_phrases: list[str] | None = None):
+    """
+    items: list of (path_or_name, caption)  OR  legacy (dest, src, caption) triples.
+    Only File Name + cleaned Caption are written.
+    """
     if not spreadsheet_id:
         log("No spreadsheet ID configured — skipping sheet logging.")
         return
-    if not saved:
+    if not items:
         log("Nothing new to log to Sheets.")
         return
     phrases = strip_phrases or []
     if phrases:
         log(f"Stripping {len(phrases)} phrase(s) from captions before writing to sheet...")
-    log(f"Writing {len(saved)} row(s) to Google Sheet ({sheet_tab})...")
+    log(f"Writing {len(items)} row(s) to Google Sheet ({sheet_tab})...")
     service = get_sheets_service()
     ensure_sheet_tab(service, spreadsheet_id, sheet_tab)
     ensure_sheet_header(service, spreadsheet_id, sheet_tab)
     rows = []
-    for dest, _src, caption in saved:
-        clean_caption = strip_caption(caption, phrases)
-        rows.append([dest.name, clean_caption])
+    for item in items:
+        if len(item) == 3:
+            dest, _src, caption = item
+            name = dest.name if hasattr(dest, "name") else str(dest)
+        else:
+            path_or_name, caption = item
+            name = path_or_name.name if hasattr(path_or_name, "name") else str(path_or_name)
+        clean_caption = strip_caption(caption or "", phrases)
+        rows.append([name, clean_caption])
     try:
         result = service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
@@ -711,6 +838,8 @@ def main():
         log(f"Video limit: none (stop = {args.max_idle_scrolls} idle scrolls per page)")
     log(f"Download concurrency: {args.download_concurrency}")
     log(f"Upload transfers: {args.upload_transfers}")
+    log(f"Editor clip-seconds: {args.clip_seconds}")
+    log(f"Skip edit: {args.skip_edit}")
 
     remote_target = rclone_remote_target(args.rclone_remote, args.rclone_config, args.folder_name)
     remote_root = f"{args.rclone_remote}:"
@@ -758,24 +887,52 @@ def main():
         push_dedup_file(remote_root, args.rclone_config)
         return
 
-    # 4. Download
+    # 4. Download originals (kept only temporarily)
     saved = download_videos(media_map, concurrency=args.download_concurrency)
+    if not saved:
+        log("No videos were successfully downloaded — nothing to process.")
+        push_dedup_file(remote_root, args.rclone_config)
+        return
 
-    # 5. Upload
-    if saved:
-        rclone_upload_all(remote_target, args.rclone_config, transfers=args.upload_transfers)
-        for dest, _src, _caption in saved:
-            if dest.exists():
-                dest.unlink()
+    # 5. Run video_auto_editor.py (UNCHANGED) → short optimized clips in EDITED_DIR
+    #    Original full downloads are NOT uploaded and NOT logged to the sheet.
+    upload_dir = DOWNLOAD_DIR
+    sheet_items = [(dest, caption) for dest, _src, caption in saved]
+
+    if not args.skip_edit:
+        ok = run_video_editor(args.clip_seconds, extra_args=args.editor_extra_args)
+        if not ok:
+            log("⚠️ Editor failed — falling back to uploading original downloads.")
+        else:
+            mapped = map_edited_files_to_captions(saved)
+            if mapped:
+                upload_dir = EDITED_DIR
+                sheet_items = mapped
+                log(f"Will upload/log {len(sheet_items)} short clip(s) from {EDITED_DIR}")
+            else:
+                log("⚠️ Editor produced no output files — falling back to originals.")
     else:
-        log("No videos were successfully downloaded — nothing to upload.")
+        log("SKIP_EDIT set — uploading raw downloads without intro/outro/watermark processing.")
 
-    # 6. Push updated dedup file + log to sheet (captions cleaned of strip phrases)
+    # 6. Upload ONLY the short clips (or originals if editor was skipped/failed)
+    rclone_upload_all(upload_dir, remote_target, args.rclone_config,
+                      transfers=args.upload_transfers)
+
+    # 7. Clean local files
+    for dest, _src, _caption in saved:
+        if dest.exists():
+            dest.unlink()
+    if EDITED_DIR.exists():
+        for f in EDITED_DIR.iterdir():
+            if f.is_file():
+                f.unlink()
+
+    # 8. Push updated dedup file + log SHORT clip names + cleaned captions to sheet
     push_dedup_file(remote_root, args.rclone_config)
     log_to_sheet(
         args.spreadsheet_id,
         args.sheet_tab or sanitize_sheet_tab_name(args.folder_name),
-        saved,
+        sheet_items,
         strip_phrases=strip_phrases,
     )
     log("=== Done ===")
