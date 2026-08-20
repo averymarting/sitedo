@@ -1,0 +1,112 @@
+name: Scrape item-post videos and upload to Mega.nz
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: |
+          One or more listing page URLs to scrape (.item-post video links).
+          Put each URL on its own line, OR separate them with commas.
+          Example:
+            https://site.com/videos
+            https://site.com/videos/category
+            https://site.com/page3
+        required: true
+        type: string
+      mega_folder_name:
+        description: "Mega.nz folder path to save videos into"
+        required: true
+        type: string
+      max_idle_scrolls:
+        description: "Stop after this many scrolls with no new videos (per page)"
+        required: false
+        default: "8"
+        type: string
+      max_videos:
+        description: "Optional: max total videos across ALL urls (leave blank = no limit)"
+        required: false
+        default: ""
+        type: string
+      spreadsheet_id:
+        description: "(optional) Google Sheet ID to log File Name + Caption into"
+        required: false
+        default: "15_9D1UMPIYkq3vgeLxf4WdIxIrl_S_Oo_BmkIOpr7ng"
+        type: string
+      sheet_tab:
+        description: "(optional) Force a specific tab name — leave blank to use the Mega folder name"
+        required: false
+        default: ""
+        type: string
+      download_concurrency:
+        description: "How many videos to download in parallel (keep low for large files)"
+        required: false
+        default: "4"
+        type: string
+      upload_transfers:
+        description: "How many files rclone uploads to Mega in parallel"
+        required: false
+        default: "4"
+        type: string
+
+jobs:
+  scrape-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install --with-deps chromium
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Write rclone config file
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: printf '%s' "$RCLONE_CONF" > rclone.conf
+
+      - name: Write Google credentials file
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > google_creds.json
+
+      - name: Run video scraper + Mega uploader
+        env:
+          PAGE_URL: ${{ inputs.page_url }}
+          MEGA_FOLDER_NAME: ${{ inputs.mega_folder_name }}
+          MAX_IDLE_SCROLLS: ${{ inputs.max_idle_scrolls }}
+          MAX_VIDEOS: ${{ inputs.max_videos }}
+          SPREADSHEET_ID: ${{ inputs.spreadsheet_id }}
+          SHEET_TAB: ${{ inputs.sheet_tab }}
+          DOWNLOAD_CONCURRENCY: ${{ inputs.download_concurrency }}
+          UPLOAD_TRANSFERS: ${{ inputs.upload_transfers }}
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
+          PYTHONUNBUFFERED: "1"
+        run: python -u sitesdo_videos.py
+
+      - name: Clean up credentials files
+        if: always()
+        run: rm -f google_creds.json rclone.conf
+
+      - name: Upload run log / leftover files as artifact (optional debug aid)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-videos
+          path: downloaded_videos/
+          if-no-files-found: ignore
