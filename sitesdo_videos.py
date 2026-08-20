@@ -45,6 +45,8 @@ ITEM_SELECTOR = ".item-post"
 DOWNLOAD_DIR = Path("downloaded_videos")
 DEDUP_FILENAME = "urls_already_downloaded_videos.txt"
 DEDUP_LOCAL_PATH = Path(DEDUP_FILENAME)
+STRIP_PHRASES_FILENAME = "strip_phrases.txt"
+STRIP_PHRASES_LOCAL_PATH = Path(STRIP_PHRASES_FILENAME)
 DEFAULT_SPREADSHEET_ID = "15_9D1UMPIYkq3vgeLxf4WdIxIrl_S_Oo_BmkIOpr7ng"
 SHEET_HEADER = ["File Name", "Caption"]
 
@@ -519,6 +521,55 @@ def pull_dedup_file(remote_root: str, config_path: str):
         log("Pulled existing urls_already_downloaded_videos.txt from Mega root.")
 
 
+def pull_strip_phrases_file(remote_root: str, config_path: str):
+    """Pull strip_phrases.txt from Mega root (one phrase per line)."""
+    result = subprocess.run(
+        ["rclone", "--config", config_path, "copyto",
+         f"{remote_root}{STRIP_PHRASES_FILENAME}", str(STRIP_PHRASES_LOCAL_PATH)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log("No strip_phrases.txt on Mega root – captions will not be filtered.")
+        STRIP_PHRASES_LOCAL_PATH.write_text("")
+    else:
+        log("Pulled strip_phrases.txt from Mega root.")
+
+
+def load_strip_phrases() -> list[str]:
+    """Load non-empty phrases from the local strip file (one phrase per line)."""
+    if not STRIP_PHRASES_LOCAL_PATH.exists():
+        return []
+    phrases = []
+    for line in STRIP_PHRASES_LOCAL_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
+        phrase = line.strip()
+        if phrase:
+            phrases.append(phrase)
+    return phrases
+
+
+def strip_caption(caption: str, phrases: list[str]) -> str:
+    """
+    Remove whole phrases from caption (case-insensitive).
+    Only matches the exact phrase text from each line — never individual words
+    unless a line in strip_phrases.txt is a single word by itself.
+    Cleans up leftover whitespace / punctuation artifacts afterwards.
+    """
+    if not caption or not phrases:
+        return (caption or "").strip()
+
+    result = caption
+    for phrase in phrases:
+        # Case-insensitive whole-phrase removal (not word-by-word)
+        pattern = re.compile(re.escape(phrase), re.IGNORECASE)
+        result = pattern.sub(" ", result)
+
+    # Collapse multiple spaces / newlines and tidy edges
+    result = re.sub(r"\s+", " ", result).strip()
+    # Optional: strip leftover leading/trailing separators that phrases often leave
+    result = re.sub(r"^[\s\-–—|:;,.]+|[\s\-–—|:;,]+$", "", result).strip()
+    return result
+
+
 def load_existing_urls() -> set:
     if DEDUP_LOCAL_PATH.exists():
         return {line.strip() for line in DEDUP_LOCAL_PATH.read_text().splitlines() if line.strip()}
@@ -614,18 +665,24 @@ def ensure_sheet_header(service, spreadsheet_id: str, sheet_tab: str):
         log("📝 Wrote sheet header row.")
 
 
-def log_to_sheet(spreadsheet_id: str, sheet_tab: str, saved: list):
+def log_to_sheet(spreadsheet_id: str, sheet_tab: str, saved: list, strip_phrases: list[str] | None = None):
     if not spreadsheet_id:
         log("No spreadsheet ID configured — skipping sheet logging.")
         return
     if not saved:
         log("Nothing new to log to Sheets.")
         return
+    phrases = strip_phrases or []
+    if phrases:
+        log(f"Stripping {len(phrases)} phrase(s) from captions before writing to sheet...")
     log(f"Writing {len(saved)} row(s) to Google Sheet ({sheet_tab})...")
     service = get_sheets_service()
     ensure_sheet_tab(service, spreadsheet_id, sheet_tab)
     ensure_sheet_header(service, spreadsheet_id, sheet_tab)
-    rows = [[dest.name, caption] for dest, _src, caption in saved]
+    rows = []
+    for dest, _src, caption in saved:
+        clean_caption = strip_caption(caption, phrases)
+        rows.append([dest.name, clean_caption])
     try:
         result = service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
@@ -662,6 +719,16 @@ def main():
     pull_dedup_file(remote_root, args.rclone_config)
     existing_urls = load_existing_urls()
     log(f"{len(existing_urls)} video page URL(s) already recorded as downloaded.")
+
+    log("🔎 Pulling strip_phrases.txt from Mega root (for caption cleaning)...")
+    pull_strip_phrases_file(remote_root, args.rclone_config)
+    strip_phrases = load_strip_phrases()
+    if strip_phrases:
+        log(f"Loaded {len(strip_phrases)} phrase(s) to strip from captions:")
+        for ph in strip_phrases:
+            log(f"  - {ph!r}")
+    else:
+        log("No phrases loaded — captions will be written as-is.")
 
     # 1. Scrape listing pages → unique video *page* URLs + captions
     all_pages = scrape_all_listings(args.urls, args.max_idle_scrolls, args.max_videos)
@@ -703,12 +770,13 @@ def main():
     else:
         log("No videos were successfully downloaded — nothing to upload.")
 
-    # 6. Push updated dedup file + log to sheet
+    # 6. Push updated dedup file + log to sheet (captions cleaned of strip phrases)
     push_dedup_file(remote_root, args.rclone_config)
     log_to_sheet(
         args.spreadsheet_id,
         args.sheet_tab or sanitize_sheet_tab_name(args.folder_name),
         saved,
+        strip_phrases=strip_phrases,
     )
     log("=== Done ===")
 
