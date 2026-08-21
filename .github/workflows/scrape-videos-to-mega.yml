@@ -79,6 +79,11 @@ on:
         required: false
         default: ""
         type: string
+      edit_workers:
+        description: "How many videos to edit in parallel (full editor features each). Default 4."
+        required: false
+        default: "4"
+        type: string
       skip_edit:
         description: "Set to 'true' to skip video_auto_editor and upload raw downloads (debug only)"
         required: false
@@ -159,6 +164,7 @@ jobs:
           DOWNLOAD_CONCURRENCY: ${{ inputs.download_concurrency }}
           UPLOAD_TRANSFERS: ${{ inputs.upload_transfers }}
           EDITOR_EXTRA_ARGS: ${{ inputs.editor_extra_args }}
+          EDIT_WORKERS: ${{ inputs.edit_workers }}
           SKIP_EDIT: ${{ inputs.skip_edit }}
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
