@@ -207,6 +207,14 @@ def parse_args():
         help="Extra CLI flags passed straight to video_auto_editor.py "
              "(e.g. '--no-optimize --watermark none')",
     )
+    p.add_argument(
+        "--edit-workers",
+        type=int,
+        default=int(os.environ.get("EDIT_WORKERS", "4")),
+        help="How many videos to edit in parallel (default 4). "
+             "Each worker runs full video_auto_editor (intro/outro/watermark/optimize). "
+             "When a batch of N finishes, the next N start.",
+    )
     p.add_argument("--headless", action="store_true", default=True)
     args = p.parse_args()
 
@@ -953,10 +961,58 @@ def rclone_upload_all(source_dir: Path, remote_target: str, config_path: str,
 # ---------------------------------------------------------------------------
 # video_auto_editor.py integration (script is used as-is, never modified)
 # ---------------------------------------------------------------------------
-def run_video_editor(clip_seconds: float, extra_args: str = "") -> bool:
+def _edit_one_video(video_path: Path, clip_seconds: float, extra_args: str) -> tuple[str, bool, str]:
     """
-    Run video_auto_editor.py in batch mode on DOWNLOAD_DIR → EDITED_DIR.
-    The editor script is left completely untouched; we only call it.
+    Run video_auto_editor.py in single-video mode on one file.
+    Full pipeline: intro/outro detect, watermark auto, split, optimize.
+    Returns (filename, success, message).
+    """
+    out_template = str(EDITED_DIR / video_path.name)
+    cmd = [
+        sys.executable, "-u", str(EDITOR_SCRIPT),
+        "--mode", "single",
+        "--input", str(video_path),
+        "--output", out_template,
+        "--clip-seconds", str(clip_seconds),
+        "--watermark", "auto",
+        # full per-video detection (no shared-batch shortcuts that skip features)
+    ]
+    if extra_args.strip():
+        cmd.extend(extra_args.split())
+
+    try:
+        result = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=3600,  # 1h safety per video
+        )
+        # Surface useful tail of stdout/stderr without flooding
+        out_tail = (result.stdout or "")[-1500:]
+        err_tail = (result.stderr or "")[-800:]
+        if result.returncode != 0:
+            msg = f"exit={result.returncode}\n{out_tail}\n{err_tail}".strip()
+            return video_path.name, False, msg
+        return video_path.name, True, out_tail.strip()[-400:] if out_tail else "ok"
+    except subprocess.TimeoutExpired:
+        return video_path.name, False, "timeout after 3600s"
+    except Exception as e:
+        return video_path.name, False, str(e)
+
+
+def run_video_editor(clip_seconds: float, extra_args: str = "",
+                     edit_workers: int = 4) -> bool:
+    """
+    Edit all videos in DOWNLOAD_DIR → EDITED_DIR using video_auto_editor.py
+    UNCHANGED, in parallel batches of `edit_workers`.
+
+    Why not one giant --mode batch?
+      Batch shared intro/outro detection scans EVERY video first (very slow on
+      100+ large files) and prints lots of harmless swscaler warnings. Processing
+      one-video-at-a-time in parallel keeps the FULL editor pipeline per file
+      (intro, outro, watermark auto, split, optimize) while using the CPU better.
+
+    Pattern: start up to N workers; when one finishes, start the next until done.
     """
     if not EDITOR_SCRIPT.exists():
         log(f"ERROR: {EDITOR_SCRIPT} not found in the working directory.")
@@ -964,27 +1020,46 @@ def run_video_editor(clip_seconds: float, extra_args: str = "") -> bool:
 
     EDITED_DIR.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        sys.executable, "-u", str(EDITOR_SCRIPT),
-        "--mode", "batch",
-        "--batch", str(DOWNLOAD_DIR),
-        "--outdir", str(EDITED_DIR),
-        "--clip-seconds", str(clip_seconds),
-        "--shared-watermark-from-first",
-        "--watermark", "auto",
-    ]
-    if extra_args.strip():
-        # naive split is fine for simple flags; users can quote carefully via env
-        cmd.extend(extra_args.split())
-
-    log(f"🎬 Running video_auto_editor.py on {DOWNLOAD_DIR} → {EDITED_DIR}")
-    log(f"   cmd: {' '.join(cmd)}")
-    result = subprocess.run(cmd, text=True)
-    if result.returncode != 0:
-        log(f"⚠️ video_auto_editor.py exited with code {result.returncode}")
+    videos = sorted(
+        p for p in DOWNLOAD_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm", ".avi")
+    )
+    if not videos:
+        log("No videos in download dir to edit.")
         return False
-    log("✅ video_auto_editor.py finished.")
-    return True
+
+    workers = max(1, min(edit_workers, len(videos)))
+    log(f"🎬 Editing {len(videos)} video(s) with video_auto_editor.py "
+        f"({workers} in parallel, full intro/outro/watermark/optimize per file)")
+    log(f"   clip-seconds={clip_seconds}  extra-args={extra_args!r}")
+
+    ok_count = 0
+    fail_count = 0
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_edit_one_video, vp, clip_seconds, extra_args): vp
+            for vp in videos
+        }
+        for fut in as_completed(futures):
+            name, success, detail = fut.result()
+            done += 1
+            if success:
+                ok_count += 1
+                log(f"  ✅ [{done}/{len(videos)}] edited: {name}")
+            else:
+                fail_count += 1
+                log(f"  ❌ [{done}/{len(videos)}] FAILED: {name} — {detail[:300]}")
+
+    log(f"Editor finished: {ok_count} ok, {fail_count} failed out of {len(videos)}")
+    # Consider success if at least one video produced output
+    produced = list(EDITED_DIR.glob("*.mp4")) + list(EDITED_DIR.glob("*.mov"))
+    if not produced:
+        log("⚠️ No edited output files found.")
+        return False
+    log(f"✅ {len(produced)} edited file(s) in {EDITED_DIR}")
+    return ok_count > 0
 
 
 def map_edited_files_to_captions(saved: list) -> list:
@@ -1132,6 +1207,7 @@ def main():
     log(f"Download concurrency: {args.download_concurrency}")
     log(f"Upload transfers: {args.upload_transfers}")
     log(f"Editor clip-seconds: {args.clip_seconds}")
+    log(f"Edit workers (parallel): {args.edit_workers}")
     log(f"Skip edit: {args.skip_edit}")
     log(f"Item selector: {args.item_selector!r}")
     _pag = repr(args.pagination_selector) if args.pagination_selector else "(none)"
@@ -1216,7 +1292,11 @@ def main():
     sheet_items = [(dest, caption) for dest, _src, caption in saved]
 
     if not args.skip_edit:
-        ok = run_video_editor(args.clip_seconds, extra_args=args.editor_extra_args)
+        ok = run_video_editor(
+            args.clip_seconds,
+            extra_args=args.editor_extra_args,
+            edit_workers=args.edit_workers,
+        )
         if not ok:
             log("⚠️ Editor failed — falling back to uploading original downloads.")
         else:
