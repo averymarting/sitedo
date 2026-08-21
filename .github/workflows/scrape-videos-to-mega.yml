@@ -5,24 +5,45 @@ on:
     inputs:
       page_url:
         description: |
-          One or more listing page URLs to scrape (.item-post video links).
+          One or more listing page URLs to scrape.
           Put each URL on its own line, OR separate them with commas.
-          Example:
-            https://site.com/videos
-            https://site.com/videos/category
         required: true
         type: string
       mega_folder_name:
         description: "Mega.nz folder path to save the SHORT optimized clips into"
         required: true
         type: string
+      item_selector:
+        description: |
+          CSS selector for each video card/item on the listing page.
+          Examples: .item-post   |   div.video-card   |   #results .clip   |   article.post
+        required: false
+        default: ".item-post"
+        type: string
+      pagination_selector:
+        description: |
+          Optional CSS selector for Next / Load-more control. Leave blank if none.
+          Examples: a.next   |   .pagination a[rel=next]   |   button.load-more   |   .pager .next a
+        required: false
+        default: ""
+        type: string
+      video_href_contains:
+        description: |
+          Only keep links whose href contains this substring (default /videos/).
+          Leave blank to keep any link inside the item.
+        required: false
+        default: "/videos/"
+        type: string
       max_idle_scrolls:
-        description: "Stop after this many scrolls with no new videos (per page)"
+        description: "Stop after this many scrolls with no NEW content (then try pagination if set)"
         required: false
         default: "8"
         type: string
       max_videos:
-        description: "Optional: max total videos across ALL urls (leave blank = no limit)"
+        description: |
+          Target number of NEW unique videos (not already on Mega).
+          Keeps scrolling/paginating until this many NEW ones are found, or content ends.
+          Leave blank = no limit (scrape until exhausted).
         required: false
         default: ""
         type: string
@@ -94,13 +115,9 @@ jobs:
 
       - name: Install Python dependencies (video_auto_editor)
         run: |
-          # Exact packages required by video_auto_editor.py
           pip install opencv-python numpy imagehash pillow
-          # Prove imports work in THIS runner before the pipeline starts
           python - <<'PY'
-          import numpy
-          import cv2
-          import imagehash
+          import numpy, cv2, imagehash
           from PIL import Image
           print("numpy", numpy.__version__)
           print("cv2", cv2.__version__)
@@ -131,6 +148,9 @@ jobs:
         env:
           PAGE_URL: ${{ inputs.page_url }}
           MEGA_FOLDER_NAME: ${{ inputs.mega_folder_name }}
+          ITEM_SELECTOR: ${{ inputs.item_selector }}
+          PAGINATION_SELECTOR: ${{ inputs.pagination_selector }}
+          VIDEO_HREF_CONTAINS: ${{ inputs.video_href_contains }}
           MAX_IDLE_SCROLLS: ${{ inputs.max_idle_scrolls }}
           MAX_VIDEOS: ${{ inputs.max_videos }}
           CLIP_SECONDS: ${{ inputs.clip_seconds }}
