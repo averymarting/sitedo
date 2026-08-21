@@ -38,6 +38,7 @@ Env vars (GitHub Actions):
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -55,7 +56,8 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-ITEM_SELECTOR = ".item-post"
+DEFAULT_ITEM_SELECTOR = ".item-post"
+DEFAULT_VIDEO_HREF_CONTAINS = "/videos/"
 DOWNLOAD_DIR = Path("downloaded_videos")
 EDITED_DIR = Path("edited_videos")
 DEDUP_FILENAME = "urls_already_downloaded_videos.txt"
@@ -131,7 +133,30 @@ def parse_args():
         "--max-videos",
         type=int,
         default=(int(os.environ["MAX_VIDEOS"]) if os.environ.get("MAX_VIDEOS") else None),
-        help="Optional cap on total videos to scrape/download/upload across all URLs.",
+        help="Target number of NEW unique videos (not already on Mega). "
+             "Keeps scrolling/paginating until this many new ones are found, "
+             "or content is exhausted.",
+    )
+    p.add_argument(
+        "--item-selector",
+        default=os.environ.get("ITEM_SELECTOR", DEFAULT_ITEM_SELECTOR),
+        help="CSS selector for each video card/item on the listing page "
+             f"(default: {DEFAULT_ITEM_SELECTOR}). Examples: .item-post, "
+             "div.video-card, #results .clip, article.post",
+    )
+    p.add_argument(
+        "--pagination-selector",
+        default=os.environ.get("PAGINATION_SELECTOR", "") or "",
+        help="Optional CSS selector for the 'Next page' / 'Load more' control. "
+             "If set, after idle scrolls the scraper clicks it and continues. "
+             "Examples: a.next, .pagination a[rel=next], button.load-more, "
+             ".pager .next a",
+    )
+    p.add_argument(
+        "--video-href-contains",
+        default=os.environ.get("VIDEO_HREF_CONTAINS", DEFAULT_VIDEO_HREF_CONTAINS),
+        help="Only keep links whose href contains this substring "
+             f"(default: {DEFAULT_VIDEO_HREF_CONTAINS}). Set empty to keep any link.",
     )
     p.add_argument(
         "--spreadsheet-id",
@@ -196,26 +221,121 @@ def parse_args():
     return args
 
 
-def is_video_page_href(href: str) -> bool:
+def is_video_page_href(href: str, href_contains: str = DEFAULT_VIDEO_HREF_CONTAINS) -> bool:
     """Keep only links that look like video detail pages."""
     if not href:
         return False
     path = urlparse(href).path.lower()
-    return "/videos/" in path and not path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".css", ".js")):
+        return False
+    if not href_contains:
+        return True
+    return href_contains.lower() in href.lower()
 
 
-def scrape_listing(url: str, max_idle_scrolls: int, max_videos: int | None = None) -> dict:
+def _try_click_pagination(page, pagination_selector: str) -> bool:
     """
-    Scroll one listing page, collecting unique video-page URLs + captions.
-    Returns: {video_page_url: caption}
+    Click the next-page / load-more control if present and enabled.
+    Returns True if a click was performed (caller should wait and continue).
     """
-    found = {}
+    if not pagination_selector:
+        return False
+    try:
+        loc = page.locator(pagination_selector).first
+        if loc.count() == 0:
+            log(f"  Pagination selector {pagination_selector!r} not found on page.")
+            return False
+        # Skip if disabled / aria-disabled
+        try:
+            disabled = loc.get_attribute("disabled")
+            aria = loc.get_attribute("aria-disabled")
+            cls = (loc.get_attribute("class") or "").lower()
+            if disabled is not None or (aria and aria.lower() == "true") or "disabled" in cls:
+                log("  Pagination control is disabled — no more pages.")
+                return False
+        except Exception:
+            pass
+
+        # Scroll into view then click
+        loc.scroll_into_view_if_needed(timeout=5000)
+        page.wait_for_timeout(300)
+        loc.click(timeout=8000)
+        log(f"  Clicked pagination control: {pagination_selector!r}")
+        return True
+    except Exception as e:
+        log(f"  Could not click pagination ({pagination_selector!r}): {e}")
+        return False
+
+
+def scrape_listing(
+    url: str,
+    max_idle_scrolls: int,
+    target_new: int | None = None,
+    existing_urls: set | None = None,
+    item_selector: str = DEFAULT_ITEM_SELECTOR,
+    pagination_selector: str = "",
+    href_contains: str = DEFAULT_VIDEO_HREF_CONTAINS,
+) -> dict:
+    """
+    Scroll (and optionally paginate) one listing, collecting unique video-page
+    URLs + captions.
+
+    target_new: stop once this many URLs that are NOT in existing_urls have been
+                collected. Already-seen (dedup) URLs do not count toward the target.
+                If None, collect until idle scrolls / no more pages.
+
+    Returns: {video_page_url: caption}  — includes only URLs gathered this run
+              (may still contain some already-known ones that appeared on the page;
+               main() filters them again before download).
+    """
+    existing_urls = existing_urls or set()
+    found: dict[str, str] = {}          # all unique hrefs seen this listing
+    new_unique = 0                      # count of hrefs not in existing_urls
     idle_scrolls = 0
     scroll_count = 0
+    page_num = 1
+    max_pages = 200                     # safety cap
 
     log(f"Launching browser and opening listing: {url}")
-    if max_videos:
-        log(f"  (remaining video budget for this page: {max_videos})")
+    log(f"  item selector: {item_selector!r}")
+    if pagination_selector:
+        log(f"  pagination selector: {pagination_selector!r}")
+    if target_new:
+        log(f"  target NEW unique videos (not already on Mega): {target_new}")
+
+    # Build extract JS; prefer links matching href_contains when provided
+    href_filter_js = json.dumps(href_contains) if href_contains else '""'
+    extract_js = f"""
+    els => {{
+        const prefer = {href_filter_js};
+        return els.map(el => {{
+            let a = null;
+            if (el.tagName === 'A') {{
+                a = el;
+            }} else if (prefer) {{
+                a = el.querySelector('a[href*="' + prefer + '"]');
+            }}
+            if (!a) a = el.querySelector('a');
+            const href = a ? (a.getAttribute('href') || a.href) : null;
+
+            let caption = '';
+            const h3 = el.querySelector('h3');
+            if (h3) caption = h3.textContent.trim();
+            if (!caption) {{
+                const h2 = el.querySelector('h2, .info h2, .title, .elips');
+                if (h2) caption = h2.textContent.trim();
+            }}
+            if (!caption) {{
+                const img = el.querySelector('img[alt]');
+                if (img) caption = (img.getAttribute('alt') || '').trim();
+            }}
+            if (!caption) {{
+                caption = (el.textContent || '').trim().slice(0, 300);
+            }}
+            return {{href, caption}};
+        }});
+    }}
+    """
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -229,36 +349,17 @@ def scrape_listing(url: str, max_idle_scrolls: int, max_videos: int | None = Non
         log("Page loaded. Waiting for initial items to render...")
         page.wait_for_timeout(2000)
 
-        extract_js = """
-        els => els.map(el => {
-            // The whole card is often an <a class="item-post">
-            let a = el.tagName === 'A' ? el : el.querySelector('a[href*="/videos/"]');
-            if (!a) a = el.querySelector('a');
-            const href = a ? (a.getAttribute('href') || a.href) : null;
+        while page_num <= max_pages:
+            # --- harvest current DOM ---
+            try:
+                items = page.eval_on_selector_all(item_selector, extract_js)
+            except Exception as e:
+                log(f"  Selector {item_selector!r} failed: {e}")
+                items = []
 
-            let caption = '';
-            // Prefer the visible title (h3 in the provided markup)
-            const h3 = el.querySelector('h3');
-            if (h3) caption = h3.textContent.trim();
-            if (!caption) {
-                const h2 = el.querySelector('h2, .info h2, .title, .elips');
-                if (h2) caption = h2.textContent.trim();
-            }
-            if (!caption) {
-                const img = el.querySelector('img[alt]');
-                if (img) caption = (img.getAttribute('alt') || '').trim();
-            }
-            if (!caption) {
-                caption = (el.textContent || '').trim().slice(0, 300);
-            }
-            return {href, caption};
-        })
-        """
-
-        while True:
-            items = page.eval_on_selector_all(ITEM_SELECTOR, extract_js)
             total_this_round = 0
             new_this_round = 0
+            already_known_this_round = 0
             dup_this_round = 0
 
             for item in items:
@@ -266,38 +367,74 @@ def scrape_listing(url: str, max_idle_scrolls: int, max_videos: int | None = Non
                 caption = (item.get("caption") or "").strip()
                 if not href:
                     continue
-                href = normalize_url(href, url)
-                if not is_video_page_href(href):
+                href = normalize_url(href, page.url)
+                if not is_video_page_href(href, href_contains):
                     continue
 
                 total_this_round += 1
                 if href in found:
                     dup_this_round += 1
+                    continue
+
+                found[href] = caption
+                if href in existing_urls:
+                    already_known_this_round += 1
                 else:
-                    found[href] = caption
                     new_this_round += 1
-                    if max_videos and len(found) >= max_videos:
-                        break
+                    new_unique += 1
+
+                if target_new and new_unique >= target_new:
+                    break
 
             log(
-                f"  Scroll #{scroll_count}: found {total_this_round} video link(s) this scroll "
-                f"→ +{new_this_round} new, {dup_this_round} duplicate(s) | "
-                f"{len(found)} unique total (idle: {idle_scrolls}/{max_idle_scrolls})"
+                f"  Page {page_num} / scroll #{scroll_count}: "
+                f"{total_this_round} link(s) → +{new_this_round} NEW, "
+                f"{already_known_this_round} already-known, {dup_this_round} in-page dups | "
+                f"{new_unique} NEW unique so far"
+                + (f" / target {target_new}" if target_new else "")
+                + f" (idle: {idle_scrolls}/{max_idle_scrolls})"
             )
 
-            if max_videos and len(found) >= max_videos:
-                log(f"  Reached video limit for this page ({max_videos}). Stopping.")
+            if target_new and new_unique >= target_new:
+                log(f"  Reached target of {target_new} NEW unique videos. Stopping scrape.")
                 break
 
-            if new_this_round == 0:
+            # Progress this pass?
+            if new_this_round == 0 and already_known_this_round == 0 and dup_this_round == total_this_round:
+                # nothing new at all on page
+                idle_scrolls += 1
+            elif new_this_round == 0:
+                # only already-known or dups — keep going (need more NEW ones)
                 idle_scrolls += 1
             else:
                 idle_scrolls = 0
 
             if idle_scrolls >= max_idle_scrolls:
-                log(f"  No new videos for {max_idle_scrolls} consecutive scrolls. Stopping.")
-                break
+                # Try pagination before giving up
+                if pagination_selector and page_num < max_pages:
+                    clicked = _try_click_pagination(page, pagination_selector)
+                    if clicked:
+                        page_num += 1
+                        idle_scrolls = 0
+                        scroll_count = 0
+                        try:
+                            page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(2000)
+                        log(f"  Moved to page {page_num}, continuing harvest...")
+                        continue
+                    else:
+                        log("  No further pagination — content exhausted.")
+                        break
+                else:
+                    log(
+                        f"  No new content for {max_idle_scrolls} consecutive scrolls "
+                        f"and no pagination (or pagination exhausted). Stopping."
+                    )
+                    break
 
+            # Scroll for infinite-scroll / lazy load
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             scroll_count += 1
             log(f"  Scrolled to bottom (scroll #{scroll_count}), waiting...")
@@ -310,26 +447,52 @@ def scrape_listing(url: str, max_idle_scrolls: int, max_videos: int | None = Non
         browser.close()
         log("Browser closed for this listing URL.")
 
-    if max_videos and len(found) > max_videos:
-        found = dict(list(found.items())[:max_videos])
+    # Return only the NEW ones toward the caller budget (keep already-known out
+    # of the "found for download" set — main also filters, but this keeps
+    # remaining target accurate across multiple listing URLs).
+    if target_new is not None:
+        # Prefer returning new ones first, capped at target_new
+        new_only = {u: c for u, c in found.items() if u not in existing_urls}
+        if len(new_only) > target_new:
+            new_only = dict(list(new_only.items())[:target_new])
+        return new_only
     return found
 
 
-def scrape_all_listings(urls: list[str], max_idle_scrolls: int, max_videos: int | None) -> dict:
-    """Scrape every listing URL, merging results. Stops early if max_videos is hit."""
+def scrape_all_listings(
+    urls: list[str],
+    max_idle_scrolls: int,
+    target_new: int | None,
+    existing_urls: set,
+    item_selector: str,
+    pagination_selector: str,
+    href_contains: str,
+) -> dict:
+    """
+    Scrape every listing URL. target_new is the global count of NEW unique
+    videos (not in existing_urls) to collect across all listing URLs.
+    """
     all_found: dict[str, str] = {}
-    remaining = max_videos
+    remaining = target_new
     for i, url in enumerate(urls, 1):
         log(f"=== Scraping listing URL {i}/{len(urls)} ===")
-        page_found = scrape_listing(url, max_idle_scrolls, remaining)
+        page_found = scrape_listing(
+            url,
+            max_idle_scrolls=max_idle_scrolls,
+            target_new=remaining,
+            existing_urls=existing_urls | set(all_found.keys()),
+            item_selector=item_selector,
+            pagination_selector=pagination_selector,
+            href_contains=href_contains,
+        )
         before = len(all_found)
         all_found.update(page_found)
         added = len(all_found) - before
-        log(f"URL {i} contributed {added} new unique video pages (total so far: {len(all_found)})")
-        if max_videos is not None:
-            remaining = max_videos - len(all_found)
+        log(f"URL {i} contributed {added} new unique video pages (total NEW so far: {len(all_found)})")
+        if target_new is not None:
+            remaining = target_new - len(all_found)
             if remaining <= 0:
-                log(f"Global video limit of {max_videos} reached. Skipping remaining URLs.")
+                log(f"Global target of {target_new} NEW unique videos reached.")
                 break
     return all_found
 
@@ -833,13 +996,17 @@ def main():
         log(f"  {i}. {u}")
     log(f"Mega folder: {args.folder_name}")
     if args.max_videos:
-        log(f"Video limit (global): {args.max_videos}")
+        log(f"Target NEW unique videos: {args.max_videos} (keeps going until found or content ends)")
     else:
-        log(f"Video limit: none (stop = {args.max_idle_scrolls} idle scrolls per page)")
+        log(f"Video limit: none (stop = {args.max_idle_scrolls} idle scrolls / no more pages)")
     log(f"Download concurrency: {args.download_concurrency}")
     log(f"Upload transfers: {args.upload_transfers}")
     log(f"Editor clip-seconds: {args.clip_seconds}")
     log(f"Skip edit: {args.skip_edit}")
+    log(f"Item selector: {args.item_selector!r}")
+    _pag = repr(args.pagination_selector) if args.pagination_selector else "(none)"
+    log(f"Pagination selector: {_pag}")
+    log(f"Video href contains: {args.video_href_contains!r}")
 
     remote_target = rclone_remote_target(args.rclone_remote, args.rclone_config, args.folder_name)
     remote_root = f"{args.rclone_remote}:"
@@ -859,22 +1026,41 @@ def main():
     else:
         log("No phrases loaded — captions will be written as-is.")
 
-    # 1. Scrape listing pages → unique video *page* URLs + captions
-    all_pages = scrape_all_listings(args.urls, args.max_idle_scrolls, args.max_videos)
-    log(f"=== Listing scrape complete: {len(all_pages)} unique video pages found ===")
+    # 1. Scrape listing pages until we have max_videos NEW unique pages
+    #    (already-known URLs do not count toward the target; keeps scrolling /
+    #    paginating until target is met or content is exhausted).
+    all_pages = scrape_all_listings(
+        args.urls,
+        max_idle_scrolls=args.max_idle_scrolls,
+        target_new=args.max_videos,
+        existing_urls=existing_urls,
+        item_selector=args.item_selector,
+        pagination_selector=args.pagination_selector,
+        href_contains=args.video_href_contains,
+    )
+    log(f"=== Listing scrape complete: {len(all_pages)} candidate video page(s) ===")
 
     if not all_pages:
         log("No video pages found — nothing to do.")
         return
 
-    # 2. Filter out already-seen pages (dedup key = video page URL)
+    # 2. Final filter against dedup (scrape already prefers new ones)
     new_pages = {u: c for u, c in all_pages.items() if u not in existing_urls}
     skipped = len(all_pages) - len(new_pages)
-    log(f"{skipped} already downloaded previously (skipped), {len(new_pages)} new.")
+    log(f"{skipped} already downloaded previously (skipped), {len(new_pages)} NEW unique.")
 
     if not new_pages:
-        log("Nothing new to process — done.")
+        log(
+            "Nothing NEW to process after dedup. "
+            "Content may be exhausted, or raise max_videos / check selectors."
+        )
         return
+
+    if args.max_videos and len(new_pages) < args.max_videos:
+        log(
+            f"Note: only found {len(new_pages)} NEW unique (target was {args.max_videos}). "
+            f"Listing content appears exhausted."
+        )
 
     # Record intent BEFORE we start downloading (so a crash still marks them as seen)
     record_new_urls(new_pages.keys())
