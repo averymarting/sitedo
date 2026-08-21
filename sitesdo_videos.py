@@ -233,35 +233,160 @@ def is_video_page_href(href: str, href_contains: str = DEFAULT_VIDEO_HREF_CONTAI
     return href_contains.lower() in href.lower()
 
 
+def dismiss_overlays(page) -> None:
+    """
+    Dismiss common age-gates / cookie banners that intercept pointer events
+    and block pagination clicks (e.g. #age-gate on erosberry).
+    """
+    # 1) Try common "I am 18 / Enter / Accept" buttons
+    click_texts = [
+        "I am 18 or older",
+        "I am 18",
+        "Enter",
+        "Accept",
+        "Agree",
+        "Yes",
+        "Continue",
+    ]
+    for text in click_texts:
+        try:
+            btn = page.get_by_role("button", name=re.compile(text, re.I))
+            if btn.count() > 0:
+                btn.first.click(timeout=2000)
+                log(f"  Dismissed overlay via button matching {text!r}")
+                page.wait_for_timeout(500)
+                break
+        except Exception:
+            pass
+        try:
+            link = page.get_by_text(re.compile(rf"^{re.escape(text)}", re.I))
+            if link.count() > 0:
+                link.first.click(timeout=2000, force=True)
+                log(f"  Dismissed overlay via text {text!r}")
+                page.wait_for_timeout(500)
+                break
+        except Exception:
+            pass
+
+    # 2) Force-remove known overlay nodes from the DOM
+    try:
+        removed = page.evaluate(
+            """
+            () => {
+              const selectors = [
+                '#age-gate', '.age-gate', '#agegate', '.agegate',
+                '#cookie-banner', '.cookie-banner', '.cookie-consent',
+                '[class*="age-gate"]', '[id*="age-gate"]'
+              ];
+              let n = 0;
+              for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach(el => {
+                  el.remove();
+                  n++;
+                });
+              }
+              // Also clear body scroll lock if present
+              document.body.style.overflow = '';
+              document.documentElement.style.overflow = '';
+              return n;
+            }
+            """
+        )
+        if removed:
+            log(f"  Removed {removed} overlay element(s) from DOM")
+            page.wait_for_timeout(300)
+    except Exception as e:
+        log(f"  Overlay cleanup note: {e}")
+
+
 def _try_click_pagination(page, pagination_selector: str) -> bool:
     """
     Click the next-page / load-more control if present and enabled.
-    Returns True if a click was performed (caller should wait and continue).
+    Handles overlays, div wrappers, and falls back to navigating the href.
+    Returns True if navigation/click succeeded.
     """
     if not pagination_selector:
         return False
+
+    # Always clear overlays before trying to paginate
+    dismiss_overlays(page)
+
     try:
         loc = page.locator(pagination_selector).first
         if loc.count() == 0:
             log(f"  Pagination selector {pagination_selector!r} not found on page.")
             return False
-        # Skip if disabled / aria-disabled
+
+        # Skip if clearly disabled
         try:
             disabled = loc.get_attribute("disabled")
             aria = loc.get_attribute("aria-disabled")
             cls = (loc.get_attribute("class") or "").lower()
-            if disabled is not None or (aria and aria.lower() == "true") or "disabled" in cls:
+            if disabled is not None or (aria and aria.lower() == "true"):
                 log("  Pagination control is disabled — no more pages.")
+                return False
+            # class "disabled" alone is not always terminal (some themes keep it on the wrapper)
+            if "disabled" in cls and "next" not in cls:
+                log("  Pagination control looks disabled — stopping.")
                 return False
         except Exception:
             pass
 
-        # Scroll into view then click
-        loc.scroll_into_view_if_needed(timeout=5000)
-        page.wait_for_timeout(300)
-        loc.click(timeout=8000)
-        log(f"  Clicked pagination control: {pagination_selector!r}")
-        return True
+        # Prefer an inner <a href="..."> if the selector points at a wrapper div
+        click_target = loc
+        href = None
+        try:
+            inner_a = loc.locator("a[href]").first
+            if inner_a.count() > 0:
+                href = inner_a.get_attribute("href")
+                click_target = inner_a
+            else:
+                href = loc.get_attribute("href")
+        except Exception:
+            pass
+
+        # Strategy 1: navigate directly via href (most reliable)
+        if href and href not in ("#", "javascript:void(0)", "javascript:;"):
+            abs_url = normalize_url(href, page.url)
+            if abs_url and abs_url != page.url:
+                log(f"  Pagination via href → {abs_url}")
+                page.goto(abs_url, wait_until="domcontentloaded", timeout=60000)
+                dismiss_overlays(page)
+                page.wait_for_timeout(1500)
+                return True
+
+        # Strategy 2: force click (ignores overlays intercepting pointer events)
+        try:
+            click_target.scroll_into_view_if_needed(timeout=5000)
+            page.wait_for_timeout(200)
+            click_target.click(timeout=5000, force=True)
+            log(f"  Force-clicked pagination: {pagination_selector!r}")
+            page.wait_for_timeout(1500)
+            dismiss_overlays(page)
+            return True
+        except Exception as e1:
+            log(f"  Force-click failed: {e1}")
+
+        # Strategy 3: JS click
+        try:
+            page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    const a = el.closest('a') || el.querySelector('a') || el;
+                    a.click();
+                    return true;
+                }""",
+                pagination_selector,
+            )
+            log(f"  JS-clicked pagination: {pagination_selector!r}")
+            page.wait_for_timeout(1500)
+            dismiss_overlays(page)
+            return True
+        except Exception as e2:
+            log(f"  JS-click failed: {e2}")
+
+        return False
     except Exception as e:
         log(f"  Could not click pagination ({pagination_selector!r}): {e}")
         return False
@@ -347,7 +472,9 @@ def scrape_listing(
         )
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         log("Page loaded. Waiting for initial items to render...")
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(1500)
+        dismiss_overlays(page)
+        page.wait_for_timeout(500)
 
         while page_num <= max_pages:
             # --- harvest current DOM ---
@@ -409,8 +536,11 @@ def scrape_listing(
             else:
                 idle_scrolls = 0
 
-            if idle_scrolls >= max_idle_scrolls:
-                # Try pagination before giving up
+            # With a pagination selector, try the next page after fewer idle
+            # rounds (page already fully known). Without pagination, wait the
+            # full max_idle_scrolls for infinite-scroll sites.
+            idle_limit = 2 if pagination_selector else max_idle_scrolls
+            if idle_scrolls >= idle_limit:
                 if pagination_selector and page_num < max_pages:
                     clicked = _try_click_pagination(page, pagination_selector)
                     if clicked:
@@ -427,7 +557,7 @@ def scrape_listing(
                     else:
                         log("  No further pagination — content exhausted.")
                         break
-                else:
+                elif idle_scrolls >= max_idle_scrolls:
                     log(
                         f"  No new content for {max_idle_scrolls} consecutive scrolls "
                         f"and no pagination (or pagination exhausted). Stopping."
